@@ -396,56 +396,60 @@ class W8A16LinearLayer(nn.Module):
         else:
             self.bias = None
 
-    def quantize(self, weights):
+    def quantize_weights(self, weights):
         w_fp32 = weights.clone().to(torch.float32)
-
         scales = w_fp32.abs().max(dim=-1).values / 127
         scales = scales.to(weights.dtype)
-
         int8_weights = torch.round(weights / scales.unsqueeze(1)).to(torch.int8)
+        return int8_weights, scales
 
-        self.int8_weights = int8_weights
-        self.scales = scales
+    def quantize_activations(self, activations):
+        a_fp32 = activations.clone().to(torch.float32)
+        scale = a_fp32.abs().max() / 127
+        scale = scale.to(activations.dtype)
+        int8_activations = torch.round(activations / scale).to(torch.int8)
+        return int8_activations, scale
 
-    def forward(self, input):
-        return w8_a16_forward(self.int8_weights, input, self.scales, self.bias)
+    def forward(self, x):
+        # Quantize activations
+        int8_x, act_scale = self.quantize_activations(x)
+
+        # Dequantize weights and activations for computation
+        dequantized_weights = self.int8_weights.to(
+            torch.float32
+        ) * self.scales.unsqueeze(1)
+        dequantized_x = int8_x.to(torch.float32) * act_scale
+
+        # Compute output
+        output = torch.matmul(dequantized_x, dequantized_weights.t())
+
+        if self.bias is not None:
+            output += self.bias
+
+        return output
 
 
 def replace_linear_with_target_and_quantize(
-    module, target_class, module_name_to_exclude
+    model, target_layer_type=nn.Linear, quantized_layer_type=W8A16LinearLayer
 ):
     """
-    A function that replaces all the linear layers in a module with a target class
-    and quantizes the weights of the new layer.
-
-    Args:
-    - module: The module to traverse
-    - target_class: The target class to replace the linear layers with
-    - module_name_to_exclude: A list of module names to exclude from the replacement
+    Replace all instances of target_layer_type in the model with quantized_layer_type.
     """
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear) and not any(
-            [x == name for x in module_name_to_exclude]
-        ):
-            old_bias = child.bias
-            old_weight = child.weight
+    for name, module in model.named_children():
+        if isinstance(module, target_layer_type):
+            in_features = module.in_features
+            out_features = module.out_features
+            bias = module.bias is not None
 
-            new_module = target_class(
-                child.in_features,
-                child.out_features,
-                old_bias is not None,
-                child.weight.dtype,
-            )
-            setattr(module, name, new_module)
+            # Create a new quantized layer with the same parameters
+            quantized_layer = quantized_layer_type(in_features, out_features, bias)
 
-            getattr(module, name).quantize(old_weight)
-
-            if old_bias is not None:
-                getattr(module, name).bias = old_bias
+            # Replace the original layer with the quantized layer
+            setattr(model, name, quantized_layer)
         else:
-            # Recursively call the function for nested modules
+            # Recursively apply to child modules
             replace_linear_with_target_and_quantize(
-                child, target_class, module_name_to_exclude
+                module, target_layer_type, quantized_layer_type
             )
 
 
@@ -478,3 +482,105 @@ def plot_results(model, pil_img, results):
         ax.text(xmin, ymin, text, fontsize=15, bbox=dict(facecolor="yellow", alpha=0.5))
     plt.axis("off")
     plt.show()
+
+
+class QuantizedConv2d(nn.Module):
+    """
+    A class that implements a Conv2d layer with 8-bit weights and quantized activations.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        bias=True,
+        dtype=torch.float32,
+    ):
+        super().__init__()
+
+        self.register_buffer(
+            "int8_weights",
+            torch.randint(
+                -128,
+                127,
+                (out_channels, in_channels, kernel_size, kernel_size),
+                dtype=torch.int8,
+            ),
+        )
+
+        self.register_buffer("scales", torch.randn((out_channels), dtype=dtype))
+
+        if bias:
+            self.register_buffer("bias", torch.randn((out_channels), dtype=dtype))
+        else:
+            self.bias = None
+
+        self.stride = stride
+        self.padding = padding
+
+    def quantize_weights(self, weights):
+        w_fp32 = weights.clone().to(torch.float32)
+        scales = w_fp32.abs().max(dim=[1, 2, 3], keepdim=True).values / 127
+        scales = scales.to(weights.dtype)
+        int8_weights = torch.round(weights / scales).to(torch.int8)
+        return int8_weights, scales
+
+    def quantize_activations(self, activations):
+        a_fp32 = activations.clone().to(torch.float32)
+        scale = a_fp32.abs().max() / 127
+        scale = scale.to(activations.dtype)
+        int8_activations = torch.round(activations / scale).to(torch.int8)
+        return int8_activations, scale
+
+    def forward(self, x):
+        # Quantize activations
+        int8_x, act_scale = self.quantize_activations(x)
+
+        # Dequantize weights and activations for computation
+        dequantized_weights = self.int8_weights.to(torch.float32) * self.scales.view(
+            -1, 1, 1, 1
+        )
+        dequantized_x = int8_x.to(torch.float32) * act_scale
+
+        # Compute output
+        output = nn.functional.conv2d(
+            dequantized_x,
+            dequantized_weights,
+            bias=self.bias,
+            stride=self.stride,
+            padding=self.padding,
+        )
+
+        return output
+
+
+def replace_conv2d_with_quantized(
+    model, target_layer_type=nn.Conv2d, quantized_layer_type=QuantizedConv2d
+):
+    """
+    Replace all instances of target_layer_type in the model with quantized_layer_type.
+    """
+    for name, module in model.named_children():
+        if isinstance(module, target_layer_type):
+            in_channels = module.in_channels
+            out_channels = module.out_channels
+            kernel_size = module.kernel_size[0]
+            stride = module.stride[0]
+            padding = module.padding[0]
+            bias = module.bias is not None
+
+            # Create a new quantized layer with the same parameters
+            quantized_layer = quantized_layer_type(
+                in_channels, out_channels, kernel_size, stride, padding, bias
+            )
+
+            # Replace the original layer with the quantized layer
+            setattr(model, name, quantized_layer)
+        else:
+            # Recursively apply to child modules
+            replace_conv2d_with_quantized(
+                module, target_layer_type, quantized_layer_type
+            )
