@@ -6,6 +6,8 @@ from PIL import Image
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
+import gc
+import numpy as np
 
 import warnings
 
@@ -351,7 +353,7 @@ def quantization_error(original_tensor, dequantized_tensor):
     return (original_tensor - dequantized_tensor).square().mean()
 
 
-def w8_a16_forward(weight, input, scales, bias=None):
+def w8_a16_forward(weight, input_data, scales, bias=None):
     """
     A function that performs the forward pass of a linear layer with 8-bit weights and 16-bit scales.
 
@@ -361,8 +363,8 @@ def w8_a16_forward(weight, input, scales, bias=None):
     - scales: The scales of the linear layer
     - bias: The bias of the linear layer
     """
-    casted_weights = weight.to(input.dtype)
-    output = F.linear(input, casted_weights) * scales
+    casted_weights = weight.to(input_data.dtype)
+    output = F.linear(input_data, casted_weights) * scales
 
     if bias is not None:
         output = output + bias
@@ -401,55 +403,73 @@ class W8A16LinearLayer(nn.Module):
         scales = w_fp32.abs().max(dim=-1).values / 127
         scales = scales.to(weights.dtype)
         int8_weights = torch.round(weights / scales.unsqueeze(1)).to(torch.int8)
-        return int8_weights, scales
+        self.int8_weights = int8_weights
+        self.scales = scales
 
     def quantize_activations(self, activations):
         a_fp32 = activations.clone().to(torch.float32)
         scale = a_fp32.abs().max() / 127
         scale = scale.to(activations.dtype)
         int8_activations = torch.round(activations / scale).to(torch.int8)
-        return int8_activations, scale
+        self.int8_x = int8_activations
+        self.act_scale = scale
+
+    def quantize(self, weights):
+        w_fp32 = weights.clone().to(torch.float32)
+        scales = w_fp32.abs().max(dim=-1).values / 127
+        scales = scales.to(weights.dtype)
+        int8_weights = torch.round(weights / scales.unsqueeze(1)).to(torch.int8)
+        self.int8_weights = int8_weights
+        self.scales = scales
 
     def forward(self, x):
-        # Quantize activations
-        int8_x, act_scale = self.quantize_activations(x)
+        return w8_a16_forward(self.int8_weights, x, self.scales, self.bias)
+        ## Quantize activations
+        # self.quantize_activations(x)
 
-        # Dequantize weights and activations for computation
-        dequantized_weights = self.int8_weights.to(
-            torch.float32
-        ) * self.scales.unsqueeze(1)
-        dequantized_x = int8_x.to(torch.float32) * act_scale
 
-        # Compute output
-        output = torch.matmul(dequantized_x, dequantized_weights.t())
-
-        if self.bias is not None:
-            output += self.bias
-
-        return output
+#
+## Dequantize weights and activations for computation
+# dequantized_weights = self.int8_weights.to(
+#    torch.float32
+# ) * self.scales.unsqueeze(1)
+# dequantized_x = self.int8_x.to(torch.float32) * self.act_scale
+#
+## Compute output
+# output = torch.matmul(dequantized_x, dequantized_weights.t())
+#
+# if self.bias is not None:
+#    output += self.bias
+#
+# return output
 
 
 def replace_linear_with_target_and_quantize(
-    model, target_layer_type=nn.Linear, quantized_layer_type=W8A16LinearLayer
+    module, target_class, module_name_to_exclude
 ):
-    """
-    Replace all instances of target_layer_type in the model with quantized_layer_type.
-    """
-    for name, module in model.named_children():
-        if isinstance(module, target_layer_type):
-            in_features = module.in_features
-            out_features = module.out_features
-            bias = module.bias is not None
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear) and not any(
+            [x == name for x in module_name_to_exclude]
+        ):
+            old_bias = child.bias
+            old_weight = child.weight
 
-            # Create a new quantized layer with the same parameters
-            quantized_layer = quantized_layer_type(in_features, out_features, bias)
+            new_module = target_class(
+                child.in_features,
+                child.out_features,
+                old_bias is not None,
+                child.weight.dtype,
+            )
+            setattr(module, name, new_module)
 
-            # Replace the original layer with the quantized layer
-            setattr(model, name, quantized_layer)
+            getattr(module, name).quantize(old_weight)
+
+            if old_bias is not None:
+                getattr(module, name).bias = old_bias
         else:
-            # Recursively apply to child modules
+            # Recursively call the function for nested modules
             replace_linear_with_target_and_quantize(
-                module, target_layer_type, quantized_layer_type
+                child, target_class, module_name_to_exclude
             )
 
 
@@ -584,3 +604,27 @@ def replace_conv2d_with_quantized(
             replace_conv2d_with_quantized(
                 module, target_layer_type, quantized_layer_type
             )
+
+
+def show_mask(mask, ax, random_color=False):
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+    else:
+        color = np.array([30 / 255, 144 / 255, 255 / 255, 0.6])
+    h, w = mask.shape[-2:]
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
+    del mask
+    gc.collect()
+
+
+def show_masks_on_image(raw_image, masks):
+    plt.imshow(np.array(raw_image))
+    ax = plt.gca()
+    ax.set_autoscale_on(False)
+    for mask in masks:
+        show_mask(mask, ax=ax, random_color=True)
+    plt.axis("off")
+    plt.show()
+    del mask
+    gc.collect()
